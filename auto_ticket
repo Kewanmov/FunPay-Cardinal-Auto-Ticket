@@ -1,0 +1,758 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+from html import escape as html_escape
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from cardinal import Cardinal
+
+import requests
+from bs4 import BeautifulSoup
+from FunPayAPI.account import Account
+from telebot.types import (
+    CallbackQuery,
+    InlineKeyboardButton as B,
+    InlineKeyboardMarkup as K,
+    Message,
+)
+from tg_bot import CBT as _CBT, static_keyboards as skb
+
+NAME = "Auto Ticket"
+VERSION = "1.0.0"
+DESCRIPTION = "Плагин для автоматической отправки информации о неподтвержденных заказах в техподдержку FunPay."
+CREDITS = "@kewanmov"
+UUID = "d217ee86-8269-4282-a1bc-c0bea1365205"
+SETTINGS_PAGE = True
+
+logger = logging.getLogger("FPC.auto_ticket")
+
+CBT_SEND = "at_send"
+CBT_EDIT_COUNT = "at_edit_count"
+CBT_EDIT_TIME = "at_edit_time"
+CBT_TOGGLE_AUTO = "at_toggle_auto"
+CBT_EDIT_INTERVAL = "at_edit_interval"
+CBT_EDIT_DAILY_LIMIT = "at_edit_daily_limit"
+CBT_TOGGLE_NOTIFY = "at_toggle_notify"
+CBT_PREVIEW = "at_preview"
+
+_STORAGE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "storage", "plugins", "auto_ticket"
+)
+os.makedirs(_STORAGE_PATH, exist_ok=True)
+_SETTINGS_FILE = os.path.join(_STORAGE_PATH, "settings.json")
+
+
+class Settings:
+    __slots__ = (
+        "order_age_hours", "max_orders_in_ticket", "sent_order_ids",
+        "auto_enabled", "auto_interval_hours", "daily_ticket_limit",
+        "notify_enabled", "tickets_today", "today_date", "_lock",
+    )
+
+    def __init__(
+        self,
+        order_age_hours: int = 24,
+        max_orders_in_ticket: int = 10,
+        sent_order_ids: Optional[set] = None,
+        auto_enabled: bool = False,
+        auto_interval_hours: int = 12,
+        daily_ticket_limit: int = 5,
+        notify_enabled: bool = True,
+        tickets_today: int = 0,
+        today_date: str = "",
+    ):
+        self.order_age_hours = max(1, min(order_age_hours, 720))
+        self.max_orders_in_ticket = max(1, min(max_orders_in_ticket, 50))
+        self.sent_order_ids: set[str] = sent_order_ids or set()
+        self.auto_enabled = auto_enabled
+        self.auto_interval_hours = max(1, min(auto_interval_hours, 168))
+        self.daily_ticket_limit = max(1, min(daily_ticket_limit, 50))
+        self.notify_enabled = notify_enabled
+        self.tickets_today = tickets_today
+        self.today_date = today_date
+        self._lock = threading.Lock()
+
+    def save(self):
+        with self._lock:
+            data = {
+                "order_age_hours": self.order_age_hours,
+                "max_orders_in_ticket": self.max_orders_in_ticket,
+                "sent_order_ids": list(self.sent_order_ids),
+                "auto_enabled": self.auto_enabled,
+                "auto_interval_hours": self.auto_interval_hours,
+                "daily_ticket_limit": self.daily_ticket_limit,
+                "notify_enabled": self.notify_enabled,
+                "tickets_today": self.tickets_today,
+                "today_date": self.today_date,
+            }
+            tmp = _SETTINGS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _SETTINGS_FILE)
+
+    @classmethod
+    def load(cls) -> Settings:
+        if os.path.exists(_SETTINGS_FILE):
+            try:
+                with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                raw["sent_order_ids"] = set(raw.get("sent_order_ids", []))
+                valid_keys = {
+                    "order_age_hours", "max_orders_in_ticket", "sent_order_ids",
+                    "auto_enabled", "auto_interval_hours", "daily_ticket_limit",
+                    "notify_enabled", "tickets_today", "today_date",
+                }
+                filtered = {k: v for k, v in raw.items() if k in valid_keys}
+                return cls(**filtered)
+            except Exception:
+                logger.exception("Ошибка загрузки настроек, дефолтные")
+        return cls()
+
+    def mark_sent(self, order_ids: list[str]):
+        with self._lock:
+            self.sent_order_ids.update(order_ids)
+        self.save()
+
+    def remaining_today(self) -> int:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.today_date != today:
+            self.today_date = today
+            self.tickets_today = 0
+            self.save()
+        return max(0, self.daily_ticket_limit - self.tickets_today)
+
+    def add_tickets_used(self, count: int):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.today_date != today:
+            self.today_date = today
+            self.tickets_today = 0
+        self.tickets_today += count
+        self.save()
+
+
+class SupportAPIError(Exception):
+    pass
+
+
+class AuthenticationError(SupportAPIError):
+    pass
+
+
+class FunPaySupportAPI:
+    BASE_URL = "https://support.funpay.com"
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2.0
+
+    def __init__(self, account: Account):
+        self._account = account
+        self._session = requests.Session()
+        if account.user_agent:
+            self._session.headers["User-Agent"] = account.user_agent
+        self._session.cookies.set("golden_key", account.golden_key)
+        self._session.cookies.set("cookie_prefs", "1")
+        self._csrf_token = ""
+
+    def _request(self, method: str, url: str, headers: Optional[dict] = None,
+                 data: Optional[dict] = None) -> requests.Response:
+        last_exc = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                resp = self._session.request(
+                    method, url,
+                    headers=headers or {},
+                    data=data or {},
+                    timeout=self._account.requests_timeout,
+                )
+                if resp.status_code in (401, 403):
+                    raise AuthenticationError(
+                        f"HTTP {resp.status_code}: golden_key невалиден"
+                    )
+                if resp.status_code >= 500:
+                    raise SupportAPIError(f"HTTP {resp.status_code} от {url}")
+                return resp
+            except AuthenticationError:
+                raise
+            except (requests.RequestException, SupportAPIError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "Support API попытка %d/%d %s %s: %s",
+                    attempt, self.MAX_RETRIES, method.upper(), url, exc,
+                )
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(self.RETRY_DELAY * attempt)
+        raise SupportAPIError(
+            f"Все {self.MAX_RETRIES} попыток к {url} исчерпаны"
+        ) from last_exc
+
+    def initialize(self) -> FunPaySupportAPI:
+        resp = self._request("GET", f"{self.BASE_URL}/")
+        soup = BeautifulSoup(resp.text, "html.parser")
+        body = soup.find("body")
+        if body is None:
+            raise SupportAPIError("Не найден <body> на support.funpay.com")
+        raw_config = body.get("data-app-config")
+        if not raw_config:
+            raise AuthenticationError("data-app-config не найден")
+        try:
+            app_data = json.loads(raw_config)
+        except json.JSONDecodeError as exc:
+            raise SupportAPIError("Не удалось разобрать data-app-config") from exc
+        csrf = app_data.get("csrfToken")
+        if not csrf:
+            raise SupportAPIError("csrfToken отсутствует")
+        self._csrf_token = csrf
+        return self
+
+    def _get_ticket_token(self) -> str:
+        resp = self._request(
+            "GET", f"{self.BASE_URL}/tickets/new/1",
+            headers={
+                "X-CSRF-Token": self._csrf_token,
+                "Referer": f"{self.BASE_URL}/",
+            },
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        inp = soup.find("input", attrs={"name": "ticket[_token]"})
+        if inp is None or not inp.get("value"):
+            raise SupportAPIError("Не найден ticket[_token]")
+        return inp["value"]
+
+    def create_ticket(self, order_ids_str: str, comment: str) -> dict:
+        ticket_token = self._get_ticket_token()
+        safe_comment = html_escape(comment, quote=True)
+        payload = {
+            "ticket[fields][1]": self._account.username,
+            "ticket[fields][2]": order_ids_str,
+            "ticket[fields][3]": "2",
+            "ticket[fields][5]": "201",
+            "ticket[comment][body_html]": f"<p>{safe_comment}</p>",
+            "ticket[comment][attachments]": "",
+            "ticket[_token]": ticket_token,
+        }
+        resp = self._request(
+            "POST", f"{self.BASE_URL}/tickets/create/1",
+            headers={
+                "Origin": self.BASE_URL,
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            data=payload,
+        )
+        try:
+            return resp.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SupportAPIError(
+                f"Ответ не JSON (status {resp.status_code})"
+            ) from exc
+
+    def close(self):
+        self._session.close()
+
+
+def _get_old_order_ids(acc: Account, age_hours: int, already_sent: set[str]) -> list[str]:
+    cutoff = datetime.now() - timedelta(hours=age_hours)
+    result: list[str] = []
+    start_from: Optional[str] = None
+    locale = None
+    subcs = None
+
+    while True:
+        for attempt in range(3):
+            try:
+                next_id, orders, locale, subcs = acc.get_sales(
+                    start_from=start_from,
+                    state="paid",
+                    locale=locale,
+                    sudcategories=subcs,
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    logger.exception("Не удалось получить страницу заказов")
+                    return result
+                time.sleep(1)
+
+        if not orders:
+            break
+
+        for order in orders:
+            if not isinstance(order.date, datetime):
+                continue
+            if order.date >= cutoff:
+                continue
+            if order.id not in already_sent:
+                result.append(order.id)
+
+        start_from = next_id
+        if not start_from:
+            break
+        time.sleep(1)
+
+    return result
+
+
+def _chunk_list(lst: list, size: int) -> list[list]:
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+
+def _send_tickets(acc: Account, order_ids: list[str],
+                  orders_per_ticket: int, max_tickets: int) -> tuple[list[str], list[str], int]:
+    if not order_ids:
+        return [], [], 0
+
+    api = FunPaySupportAPI(acc)
+    try:
+        api.initialize()
+    except AuthenticationError:
+        logger.error("Авторизация в support.funpay.com не удалась")
+        return [], list(order_ids), 0
+    except Exception:
+        logger.exception("Не удалось инициализировать Support API")
+        return [], list(order_ids), 0
+
+    chunks = _chunk_list(order_ids, orders_per_ticket)
+    if len(chunks) > max_tickets:
+        skipped_chunks = chunks[max_tickets:]
+        chunks = chunks[:max_tickets]
+        skipped_ids = [oid for ch in skipped_chunks for oid in ch]
+    else:
+        skipped_ids = []
+
+    succeeded: list[str] = []
+    failed: list[str] = list(skipped_ids)
+    tickets_created = 0
+
+    try:
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                time.sleep(2)
+
+            formatted = ", ".join(chunk)
+            comment = (
+                f"Здравствуйте! Прошу подтвердить заказы, "
+                f"ожидающие подтверждения: {formatted}. "
+                f"С уважением, {acc.username}!"
+            )
+
+            try:
+                resp = api.create_ticket(formatted, comment)
+            except AuthenticationError:
+                logger.error("golden_key протух, прерываем")
+                failed.extend(chunk)
+                for remaining in chunks[i + 1:]:
+                    failed.extend(remaining)
+                break
+            except SupportAPIError:
+                logger.exception("Ошибка тикета для %s", formatted)
+                failed.extend(chunk)
+                continue
+
+            error = resp.get("error")
+            action = resp.get("action", {})
+
+            if isinstance(action, dict):
+                message = action.get("message", "")
+                url = action.get("url", "")
+            else:
+                message = ""
+                url = ""
+
+            if error:
+                logger.error("Ошибка от support: %s", error)
+                failed.extend(chunk)
+                break
+
+            if "заявка отправлена" in message.lower() or "/tickets/" in url:
+                logger.info("Тикет создан для %d заказов: %s", len(chunk), url)
+                succeeded.extend(chunk)
+                tickets_created += 1
+            else:
+                logger.warning("Неожиданный ответ: %s", resp)
+                failed.extend(chunk)
+    finally:
+        api.close()
+
+    return succeeded, failed, tickets_created
+
+
+SETTINGS: Optional[Settings] = None
+_auto_thread: Optional[threading.Thread] = None
+_auto_stop_event = threading.Event()
+_cardinal_ref: Optional[Cardinal] = None
+
+
+def _get_notify_chat_id() -> Optional[int]:
+    if _cardinal_ref is None or not _cardinal_ref.telegram:
+        return None
+    tg = _cardinal_ref.telegram
+    if hasattr(tg, "authorized_users") and tg.authorized_users:
+        if isinstance(tg.authorized_users, dict):
+            return next(iter(tg.authorized_users.values()), None)
+        if isinstance(tg.authorized_users, list):
+            return tg.authorized_users[0] if tg.authorized_users else None
+    return None
+
+
+def _send_notification(text: str):
+    if not SETTINGS.notify_enabled:
+        return
+    chat_id = _get_notify_chat_id()
+    if not chat_id or not _cardinal_ref or not _cardinal_ref.telegram:
+        return
+    try:
+        _cardinal_ref.telegram.bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Не удалось отправить уведомление")
+
+
+def _run_ticket_cycle(acc: Account) -> tuple[int, int, list[str], int]:
+    remaining = SETTINGS.remaining_today()
+    if remaining <= 0:
+        logger.info("Достигнут дневной лимит тикетов (%d)", SETTINGS.daily_ticket_limit)
+        return 0, 0, [], 0
+
+    order_ids = _get_old_order_ids(acc, SETTINGS.order_age_hours, SETTINGS.sent_order_ids)
+    if not order_ids:
+        return 0, 0, [], 0
+
+    succeeded, failed, tickets_created = _send_tickets(
+        acc, order_ids, SETTINGS.max_orders_in_ticket, remaining,
+    )
+
+    if succeeded:
+        SETTINGS.mark_sent(succeeded)
+    if tickets_created > 0:
+        SETTINGS.add_tickets_used(tickets_created)
+
+    return len(order_ids), len(succeeded), succeeded, tickets_created
+
+
+def _auto_loop(acc: Account):
+    logger.info("Автозапуск активирован (каждые %d ч.)", SETTINGS.auto_interval_hours)
+    while not _auto_stop_event.is_set():
+        try:
+            total, sent, reported, tickets = _run_ticket_cycle(acc)
+
+            if SETTINGS.notify_enabled:
+                if sent > 0:
+                    ids_str = ", ".join(f"#{oid}" for oid in reported)
+                    _send_notification(
+                        f"🤖 <b>Auto Ticket</b>\n\n"
+                        f"Тикетов: {tickets} | Заказов: {sent}\n"
+                        f"<code>{ids_str}</code>"
+                    )
+                elif total > 0:
+                    _send_notification(
+                        f"🤖 <b>Auto Ticket</b>\n\n"
+                        f"Найдено {total} заказов, но тикеты не отправлены."
+                    )
+
+        except Exception:
+            logger.exception("Ошибка автоцикла")
+            if SETTINGS.notify_enabled:
+                _send_notification("⚠️ <b>Auto Ticket</b> — ошибка автоцикла. См. логи.")
+
+        _auto_stop_event.wait(SETTINGS.auto_interval_hours * 3600)
+
+    logger.info("Автозапуск остановлен")
+
+
+def _start_auto(acc: Account):
+    global _auto_thread
+    _stop_auto()
+    _auto_stop_event.clear()
+    _auto_thread = threading.Thread(target=_auto_loop, args=(acc,), name="at_auto", daemon=True)
+    _auto_thread.start()
+
+
+def _stop_auto():
+    global _auto_thread
+    _auto_stop_event.set()
+    if _auto_thread is not None:
+        _auto_thread.join(timeout=5)
+        _auto_thread = None
+
+
+def _main_text(status: str = "") -> str:
+    s = SETTINGS
+    auto_icon = "✅" if s.auto_enabled else "❌"
+    notify_icon = "🔔" if s.notify_enabled else "🔕"
+    remaining = s.remaining_today()
+    text = (
+        f"⚙️ <b>Настройки Auto Ticket</b>\n\n"
+        f"∟ Заказов в тикете: <b>{s.max_orders_in_ticket}</b>\n"
+        f"∟ Старше: <b>{s.order_age_hours}</b> ч.\n"
+        f"∟ Отправлено тикетов ранее: <b>{len(s.sent_order_ids)}</b>"
+    )
+    if status:
+        text += f"\n\n{status}"
+    return text
+
+
+def _main_kb() -> K:
+    s = SETTINGS
+    kb = K()
+
+    kb.add(B("🔗 Отправить заказы в ТП", callback_data=f"{CBT_SEND}:"))
+    kb.add(B("🔍 Превью заказов", callback_data=f"{CBT_PREVIEW}:"))
+
+    kb.row(
+        B(f"📋 В тикете: {s.max_orders_in_ticket}", callback_data=f"{CBT_EDIT_COUNT}:"),
+        B(f"⏳ Старше: {s.order_age_hours} ч.", callback_data=f"{CBT_EDIT_TIME}:"),
+    )
+
+    auto_icon = "✅" if s.auto_enabled else "❌"
+    kb.row(
+        B(f"{auto_icon} Авто", callback_data=f"{CBT_TOGGLE_AUTO}:"),
+        B(f"⏱ {s.auto_interval_hours} ч.", callback_data=f"{CBT_EDIT_INTERVAL}:"),
+    )
+
+    notify_icon = "🔔" if s.notify_enabled else "🔕"
+    kb.row(
+        B(f"🛡 Лимит: {s.daily_ticket_limit}/день", callback_data=f"{CBT_EDIT_DAILY_LIMIT}:"),
+        B(f"{notify_icon} Увед.", callback_data=f"{CBT_TOGGLE_NOTIFY}:"),
+    )
+
+    kb.add(B("⬅️ Назад", callback_data=f"{_CBT.EDIT_PLUGIN}:{UUID}:0"))
+    return kb
+
+
+def _cleanup(cardinal: Cardinal, *args):
+    global SETTINGS, _cardinal_ref
+    _stop_auto()
+    SETTINGS = None
+    _cardinal_ref = None
+
+
+def init_commands(cardinal: Cardinal, *args):
+    global SETTINGS, _cardinal_ref
+    SETTINGS = Settings.load()
+    _cardinal_ref = cardinal
+
+    if not cardinal.telegram:
+        return
+
+    tg = cardinal.telegram
+    bot = tg.bot
+    acc = cardinal.account
+
+    def _edit(c: CallbackQuery, text: str, kb: K):
+        try:
+            bot.edit_message_text(
+                text, c.message.chat.id, c.message.id,
+                reply_markup=kb, parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    def open_menu(c: CallbackQuery):
+        _edit(c, _main_text(), _main_kb())
+        bot.answer_callback_query(c.id)
+
+    def act_preview(c: CallbackQuery):
+        bot.answer_callback_query(c.id, "⏳ Сканирую...")
+        _edit(c, _main_text("⏳ <b>Сканирование...</b>"), _main_kb())
+
+        def _worker():
+            try:
+                order_ids = _get_old_order_ids(
+                    acc, SETTINGS.order_age_hours, SETTINGS.sent_order_ids,
+                )
+                if not order_ids:
+                    _edit(c, _main_text("ℹ️ Нет старых неподтверждённых заказов."), _main_kb())
+                    return
+
+                ids_str = ", ".join(f"#{oid}" for oid in order_ids[:30])
+                remaining = SETTINGS.remaining_today()
+                chunks = len(_chunk_list(order_ids, SETTINGS.max_orders_in_ticket))
+                status = (
+                    f"🔍 <b>Превью</b>\n"
+                    f"Найдено заказов: <b>{len(order_ids)}</b>\n"
+                    f"Тикетов потребуется: <b>{chunks}</b>\n"
+                    f"Лимит осталось: <b>{remaining}</b>\n\n"
+                    f"<code>{ids_str}</code>"
+                )
+                _edit(c, _main_text(status), _main_kb())
+            except Exception:
+                logger.exception("Ошибка превью")
+                _edit(c, _main_text("❌ Ошибка. См. логи."), _main_kb())
+
+        threading.Thread(target=_worker, name="at_preview", daemon=True).start()
+
+    def act_send(c: CallbackQuery):
+        remaining = SETTINGS.remaining_today()
+        if remaining <= 0:
+            bot.answer_callback_query(
+                c.id, f"⛔ Дневной лимит ({SETTINGS.daily_ticket_limit}) исчерпан!", show_alert=True,
+            )
+            return
+
+        bot.answer_callback_query(c.id, "⏳ Сканирую заказы...")
+        _edit(c, _main_text("⏳ <b>Сканирование...</b>"), _main_kb())
+
+        def _worker():
+            try:
+                total, sent, reported, tickets = _run_ticket_cycle(acc)
+
+                if sent > 0:
+                    ids_str = ", ".join(f"#{oid}" for oid in reported)
+                    status = (
+                        f"✅ Тикетов: {tickets} | Заказов: {sent}\n"
+                        f"<code>{ids_str}</code>"
+                    )
+                elif total > 0:
+                    status = f"⚠️ Найдено {total}, но тикеты не отправлены."
+                else:
+                    status = "ℹ️ Нет старых неподтверждённых заказов."
+
+                _edit(c, _main_text(status), _main_kb())
+            except Exception:
+                logger.exception("Ошибка отправки тикетов")
+                _edit(c, _main_text("❌ Ошибка. См. логи."), _main_kb())
+
+        threading.Thread(target=_worker, name="at_send", daemon=True).start()
+
+    def act_edit_time(c: CallbackQuery):
+        def handler(m: Message):
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            try:
+                val = int(m.text.strip())
+                if not (1 <= val <= 720):
+                    raise ValueError
+            except (ValueError, TypeError):
+                bot.reply_to(m, "❌ Введите число от 1 до 720.")
+                return
+            SETTINGS.order_age_hours = val
+            SETTINGS.save()
+            bot.send_message(m.chat.id, _main_text(), reply_markup=_main_kb(), parse_mode="HTML")
+
+        msg = bot.send_message(
+            c.message.chat.id,
+            f"Введите время (часы, 1–720):\nТекущее: <b>{SETTINGS.order_age_hours}</b>",
+            reply_markup=skb.CLEAR_STATE_BTN(), parse_mode="HTML",
+        )
+        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, CBT_EDIT_TIME, {})
+        tg.msg_handler(handler, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_TIME))
+        bot.answer_callback_query(c.id)
+
+    def act_edit_count(c: CallbackQuery):
+        def handler(m: Message):
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            try:
+                bot.delete_message(m.chat.id, m.message_id)
+            except Exception:
+                pass
+            try:
+                val = int(m.text.strip())
+                if not (1 <= val <= 50):
+                    raise ValueError
+            except (ValueError, TypeError):
+                bot.reply_to(m, "❌ Введите число от 1 до 50.")
+                return
+            SETTINGS.max_orders_in_ticket = val
+            SETTINGS.save()
+            _edit(c, _main_text(), _main_kb())
+
+        msg = bot.send_message(
+            c.message.chat.id,
+            f"Макс. заказов в тикете (1–50):\nТекущее: <b>{SETTINGS.max_orders_in_ticket}</b>",
+            reply_markup=skb.CLEAR_STATE_BTN(), parse_mode="HTML",
+        )
+        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, CBT_EDIT_COUNT, {})
+        tg.msg_handler(handler, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_COUNT))
+        bot.answer_callback_query(c.id)
+
+    def act_edit_interval(c: CallbackQuery):
+        def handler(m: Message):
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            try:
+                val = int(m.text.strip())
+                if not (1 <= val <= 168):
+                    raise ValueError
+            except (ValueError, TypeError):
+                bot.reply_to(m, "❌ Введите число от 1 до 168.")
+                return
+            SETTINGS.auto_interval_hours = val
+            SETTINGS.save()
+            if SETTINGS.auto_enabled:
+                _start_auto(acc)
+            bot.send_message(m.chat.id, _main_text(), reply_markup=_main_kb(), parse_mode="HTML")
+
+        msg = bot.send_message(
+            c.message.chat.id,
+            f"Интервал автозапуска (часы, 1–168):\nТекущее: <b>{SETTINGS.auto_interval_hours}</b>",
+            reply_markup=skb.CLEAR_STATE_BTN(), parse_mode="HTML",
+        )
+        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, CBT_EDIT_INTERVAL, {})
+        tg.msg_handler(handler, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_INTERVAL))
+        bot.answer_callback_query(c.id)
+
+    def act_edit_daily_limit(c: CallbackQuery):
+        def handler(m: Message):
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            try:
+                val = int(m.text.strip())
+                if not (1 <= val <= 50):
+                    raise ValueError
+            except (ValueError, TypeError):
+                bot.reply_to(m, "❌ Введите число от 1 до 50.")
+                return
+            SETTINGS.daily_ticket_limit = val
+            SETTINGS.save()
+            bot.send_message(m.chat.id, _main_text(), reply_markup=_main_kb(), parse_mode="HTML")
+
+        msg = bot.send_message(
+            c.message.chat.id,
+            f"Лимит тикетов в сутки (1–50):\nТекущее: <b>{SETTINGS.daily_ticket_limit}</b>",
+            reply_markup=skb.CLEAR_STATE_BTN(), parse_mode="HTML",
+        )
+        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, CBT_EDIT_DAILY_LIMIT, {})
+        tg.msg_handler(handler, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_DAILY_LIMIT))
+        bot.answer_callback_query(c.id)
+
+    def act_toggle_auto(c: CallbackQuery):
+        SETTINGS.auto_enabled = not SETTINGS.auto_enabled
+        SETTINGS.save()
+        if SETTINGS.auto_enabled:
+            _start_auto(acc)
+            bot.answer_callback_query(c.id, "✅ Автозапуск включён")
+        else:
+            _stop_auto()
+            bot.answer_callback_query(c.id, "❌ Автозапуск выключен")
+        _edit(c, _main_text(), _main_kb())
+
+    def act_toggle_notify(c: CallbackQuery):
+        SETTINGS.notify_enabled = not SETTINGS.notify_enabled
+        SETTINGS.save()
+        icon = "🔔 Вкл" if SETTINGS.notify_enabled else "🔕 Выкл"
+        bot.answer_callback_query(c.id, f"Уведомления: {icon}")
+        _edit(c, _main_text(), _main_kb())
+
+    def cmd_menu(m: Message):
+        bot.send_message(m.chat.id, _main_text(), reply_markup=_main_kb(), parse_mode="HTML")
+
+    tg.cbq_handler(open_menu, lambda c: f"{_CBT.PLUGIN_SETTINGS}:{UUID}" in c.data)
+    tg.cbq_handler(act_send, lambda c: c.data == f"{CBT_SEND}:")
+    tg.cbq_handler(act_preview, lambda c: c.data == f"{CBT_PREVIEW}:")
+    tg.cbq_handler(act_edit_time, lambda c: c.data == f"{CBT_EDIT_TIME}:")
+    tg.cbq_handler(act_edit_count, lambda c: c.data == f"{CBT_EDIT_COUNT}:")
+    tg.cbq_handler(act_edit_interval, lambda c: c.data == f"{CBT_EDIT_INTERVAL}:")
+    tg.cbq_handler(act_edit_daily_limit, lambda c: c.data == f"{CBT_EDIT_DAILY_LIMIT}:")
+    tg.cbq_handler(act_toggle_auto, lambda c: c.data == f"{CBT_TOGGLE_AUTO}:")
+    tg.cbq_handler(act_toggle_notify, lambda c: c.data == f"{CBT_TOGGLE_NOTIFY}:")
+    tg.msg_handler(cmd_menu, commands=["auto_ticket"])
+    cardinal.add_telegram_commands(UUID, [("auto_ticket", "открыть меню авто-тикета", True)])
+
+    if SETTINGS.auto_enabled:
+        _start_auto(acc)
+
+
+BIND_TO_PRE_INIT = [init_commands]
+BIND_TO_DELETE = [_cleanup]
